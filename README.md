@@ -5,10 +5,17 @@
 
 ## 为什么不会漏行 / 重记 / 错用偏移
 
+核心原则：**文件身份以“打开后文件描述符的 `fstat(dev,ino)`”为准，而不是路径或扫描快照。**
+目录扫描只决定“尝试打开哪些路径”；每个文件 `open` 后立即 `fstat` 校验，
+描述符在整个读取期间锁定 inode，因此轮转落在采集的任何时刻都不会错记。
+
 | 风险 | 设计对策 |
 | --- | --- |
+| **轮转发生在扫描后、打开前**：路径已指向新 inode | `open` 后 `fstat` 与扫描身份比对，不一致即丢弃描述符、**重扫目录重来**；新文件绝不会记到旧 inode（不漏旧行、不重记、不串身份） |
+| **轮转发生在打开后、读取前/中**：名称已变但 fd 仍在 | fd 锁定已打开的旧 inode，字节与偏移物理正确；提交前再按 inode **重新解析当前名称**，归档名随实际文件走，标签不新旧混用 |
 | 轮转后把旧偏移用到新文件 | 文件身份用 `(st_dev, st_ino)`，**不是文件名**。rename 后旧 inode 与新 inode 各自独立追踪 |
 | 旧文件轮转后仍被短暂写入 | 旧 inode 继续按已提交偏移采集到 EOF；归档永不删除、不截断 |
+| 一个 inode 多个名字（硬链接） | 单轮按 inode 去重，每个物理文件每轮只采一次 |
 | 读到写了一半的行 | 只入仓以 `\n` 结尾的完整行；未换行尾部保持原偏移，下轮重读 |
 | 进程在写入中途/前后退出 | 行数据与“下一字节偏移”在**同一个 SQLite 事务**提交，重启从最后提交点续采 |
 | 查询读到半成品 | WAL + 事务隔离，查询只能看到已完整提交的事务 |
@@ -26,7 +33,15 @@
 │   └── app/main.py         # API（/docs 可用）
 ├── nginx/                  # JSON 行日志格式 + 可控轮转脚本
 ├── traffic/                # 持续请求生成器（含 4xx/5xx）
-└── tests/                  # 41 项单元/集成断言 + 端到端模拟
+├── scripts/
+│   ├── rotate.sh             # 手动触发一次轮转
+│   ├── verify.sh             # 核对 offset==size、事件/坏行计数、5xx
+│   └── interleave_demo.sh    # 可控“轮转×采集”交错演示（Docker）
+└── tests/
+    ├── test_collector.py     # 46 项单元/集成断言（部分行/轮转/崩溃/重复/API）
+    ├── test_rotation_race.py # 31 项确定性交错竞态断言（两个竞态窗口+重启收敛）
+    ├── interleave_demo.py    # 纯标准库本地交错演示（无需 Docker）
+    └── e2e_sim.py            # 完整服务启停 + 轮转 + 重启续采 E2E
 ```
 
 ## 快速开始
@@ -53,6 +68,20 @@ docker compose exec nginx /usr/local/bin/rotate-nginx-log.sh
 # 自定义归档后缀
 docker compose exec nginx ROTATE_NAME=incident-1 \
     /usr/local/bin/rotate-nginx-log.sh
+```
+
+### 可控交错轮转演示（重点）
+
+专门演示“轮转正好落在采集过程中”的两种竞态，并自动核对
+不漏行、不重记、来源身份与偏移始终对应同一物理文件：
+
+```bash
+# Docker 版：起真实 nginx/collector/traffic，采集进行中快速连续轮转 6 次，
+# 随后自动核对 offset==size、物理行唯一、按路径/状态码查询
+./scripts/interleave_demo.sh 6
+
+# 无 Docker 的本地版（纯标准库，确定性地把轮转注入 open / read 边界）
+python -I tests/interleave_demo.py
 ```
 
 ### 自动周期轮转（演示轮转与采集交错）
@@ -112,8 +141,9 @@ ingest_state(dev, inode, source_code, path, offset, last_seen)  -- 续采位置
 malformed_lines(..., raw_line, error)                            -- 坏行隔离
 ```
 
-- `source_code`：来源文件代号（当前文件名/归档名）。
-- `byte_offset`：该行在其来源文件中的起始字节位置。
+- `source_code`：来源文件代号（提交时按 inode 重新解析的当前文件名/归档名），
+  与 `(dev,inode)`、`byte_offset` 共同指向同一个实际物理文件。
+- `byte_offset`：该行在其来源文件中的起始字节位置（基于锁定 inode 的 fd 计算）。
 - 唯一索引 `(dev, inode, source_code, byte_offset)` 是防重的最后防线；
   内容不在键中，所以两行完全相同也分别保留。
 - SQLite 运行在 `WAL + synchronous=FULL`：提交即落盘，读不阻塞写。
@@ -134,12 +164,16 @@ malformed_lines(..., raw_line, error)                            -- 坏行隔离
 python3 -m venv --without-pip .venv && . .venv/bin/activate
 # 若 venv 内无 pip：python get-pip.py
 pip install -r collector/requirements.txt httpx pyyaml
-python -I tests/test_collector.py   # 41 项：部分行/轮转/崩溃恢复/重复行/API
-python -I tests/e2e_sim.py          # 完整服务启停 + 轮转 + 重启续采 E2E
+python -I tests/test_collector.py     # 46 项：部分行/轮转/崩溃恢复/重复行/API
+python -I tests/test_rotation_race.py # 31 项：扫描后/打开后两种交错 + 重启收敛
+python -I tests/interleave_demo.py    # 确定性交错轮转演示（含核对）
+python -I tests/e2e_sim.py            # 完整服务启停 + 轮转 + 重启续采 E2E
 ```
 
 覆盖的关键场景：未换行尾部等待补齐、rename 轮转双 inode、旧 inode 延迟写入、
-20 轮随机“进程退出”后续采不漏不重、相同内容多行保留、坏行隔离、分页与过滤。
+**轮转落在扫描后/打开前与打开后/读取前两个竞态窗口的身份一致性**、
+20 轮随机“进程退出”后续采不漏不重、交错后重启完整收齐两份文件、
+相同内容多行保留、坏行隔离、分页与过滤。
 
 ## 故障排查
 
